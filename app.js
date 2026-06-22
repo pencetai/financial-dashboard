@@ -172,6 +172,7 @@ let remoteSearchKeyword = "";
 let isSearchingNews = false;
 let isLoadingWatchNews = false;
 let watchNewsSource = "备用数据";
+let watchNewsNextRefreshAt = "";
 
 const hotMoneyCandidates = [
   { rank: 1, name: "中际旭创", symbol: "300308", theme: "CPO/算力", funds: "章盟主、作手新一、机构席位", score: 96, signal: "多席位反复参与，板块辨识度高", risk: "高位波动" },
@@ -395,7 +396,7 @@ function updateSearchStatus() {
   }
   watchSearchStatus.textContent = isLoadingWatchNews
     ? "正在自动获取已关注股票的近 7 日真实新闻热榜..."
-    : `关注热榜来源：${watchNewsSource}。搜索框仅作为临时补充入口。`;
+    : `关注热榜来源：${watchNewsSource}${watchNewsNextRefreshAt ? `，下次自动刷新：${watchNewsNextRefreshAt}` : ""}。搜索框仅作为临时补充入口。`;
 }
 
 function groupTopNews(group) {
@@ -443,7 +444,12 @@ async function loadWatchNews() {
       const group = watchGroups.find((item) => item.id === activeWatchGroupId) || watchGroups[0];
       activeNewsId = groupTopNews(group).id;
       watchNewsSource =
-        payload.source === "google-news-rss-watch" ? "真实联网新闻" : payload.source === "mixed-watch-news" ? "真实新闻 + 备用数据" : "备用数据";
+        payload.source === "scheduled-watch-feeds"
+          ? "定时定向数据源"
+          : payload.source === "mixed-scheduled-watch-feeds"
+          ? "定向数据源 + 备用数据"
+          : "备用数据";
+      watchNewsNextRefreshAt = payload.nextRefreshAt ? new Date(payload.nextRefreshAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }) : "";
     }
   } catch {
     watchNewsSource = "备用数据";

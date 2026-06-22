@@ -7,7 +7,10 @@ const PORT = Number(process.env.PORT || 3000);
 const ROOT = __dirname;
 const DATA_DIR = path.join(ROOT, "data");
 const STORE_FILE = path.join(DATA_DIR, "store.json");
+const WATCH_NEWS_CACHE_KEY = "watch:auto:scheduled:v1";
+const WATCH_NEWS_REFRESH_MS = Number(process.env.WATCH_NEWS_REFRESH_MS || 60 * 60 * 1000);
 const sessions = new Map();
+let isRefreshingWatchNews = false;
 
 const defaultWatchTargets = [
   {
@@ -136,6 +139,7 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`Financial dashboard server running on http://127.0.0.1:${PORT}`);
+  startWatchNewsScheduler();
 });
 
 async function handleApi(req, res, url) {
@@ -202,30 +206,17 @@ async function searchNews(req, res) {
 
 async function watchNewsOverview(res) {
   const store = readStore();
-  const cacheKey = "watch:auto:v6";
-  const cached = store.newsCache[cacheKey];
-  const ttlMs = 30 * 60 * 1000;
-  if (cached && Date.now() - cached.savedAt < ttlMs) {
-    return sendJson(res, 200, { ...cached.payload, cache: "hit" });
-  }
+  const cached = store.newsCache?.[WATCH_NEWS_CACHE_KEY];
+  const isFresh = cached && Date.now() - cached.savedAt < WATCH_NEWS_REFRESH_MS;
+  if (!isFresh) refreshWatchedNewsCache("api-stale").catch((error) => console.error("watch news refresh failed", error.message));
 
-  const remoteGroups = await fetchWatchedNewsGroups().catch(() => []);
-  const fallbackIds = new Set(defaultWatchTargets.map((target) => target.id));
-  const remoteById = new Map(remoteGroups.map((group) => [group.id, group]));
-  const fallbackById = new Map(watchGroups.filter((group) => fallbackIds.has(group.id)).map((group) => [group.id, group]));
-  const groups = defaultWatchTargets
-    .map((target) => remoteById.get(target.id) || fallbackById.get(target.id))
-    .filter(Boolean);
-  const payload = {
-    generatedAt: new Date().toISOString(),
-    source: remoteGroups.length === defaultWatchTargets.length ? "google-news-rss-watch" : remoteGroups.length ? "mixed-watch-news" : "mock-watch-news",
-    rule: "已关注股票自动热榜：近 7 日、强相关、两星以上、每只最多 20 条",
-    groups
-  };
-
-  store.newsCache[cacheKey] = { savedAt: Date.now(), payload };
-  writeStore(store);
-  sendJson(res, 200, { ...payload, cache: "miss" });
+  const payload = cached?.payload || buildWatchNewsPayload([], "fallback");
+  sendJson(res, 200, {
+    ...payload,
+    cache: cached ? (isFresh ? "hit" : "stale") : "fallback",
+    nextRefreshAt: new Date((cached?.savedAt || Date.now()) + WATCH_NEWS_REFRESH_MS).toISOString(),
+    refreshIntervalMs: WATCH_NEWS_REFRESH_MS
+  });
 }
 
 async function hotMoneyStrategy(res) {
@@ -235,6 +226,49 @@ async function hotMoneyStrategy(res) {
     source: candidates.length ? "eastmoney-lhb" : "mock-hot-money",
     candidates: candidates.length ? candidates : hotMoneyCandidates
   });
+}
+
+function startWatchNewsScheduler() {
+  refreshWatchedNewsCache("startup").catch((error) => console.error("watch news startup refresh failed", error.message));
+  setInterval(() => {
+    refreshWatchedNewsCache("schedule").catch((error) => console.error("watch news scheduled refresh failed", error.message));
+  }, WATCH_NEWS_REFRESH_MS);
+}
+
+async function refreshWatchedNewsCache(reason) {
+  if (isRefreshingWatchNews) return;
+  isRefreshingWatchNews = true;
+  try {
+    const remoteGroups = await fetchWatchedNewsGroups().catch(() => []);
+    const payload = buildWatchNewsPayload(remoteGroups, reason);
+    const store = readStore();
+    store.newsCache = store.newsCache || {};
+    store.newsCache[WATCH_NEWS_CACHE_KEY] = { savedAt: Date.now(), payload };
+    writeStore(store);
+    console.log(`watch news refreshed: ${payload.source}, ${payload.groups.length} groups`);
+  } finally {
+    isRefreshingWatchNews = false;
+  }
+}
+
+function buildWatchNewsPayload(remoteGroups, reason) {
+  const remoteById = new Map(remoteGroups.map((group) => [group.id, group]));
+  const fallbackIds = new Set(defaultWatchTargets.map((target) => target.id));
+  const fallbackById = new Map(
+    watchGroups
+      .filter((group) => fallbackIds.has(group.id))
+      .map((group) => [group.id, { ...group, source: "fallback-watch-data" }])
+  );
+  const groups = defaultWatchTargets
+    .map((target) => remoteById.get(target.id) || fallbackById.get(target.id))
+    .filter(Boolean);
+  return {
+    generatedAt: new Date().toISOString(),
+    source: remoteGroups.length === defaultWatchTargets.length ? "scheduled-watch-feeds" : remoteGroups.length ? "mixed-scheduled-watch-feeds" : "mock-watch-news",
+    refreshReason: reason,
+    rule: "已关注股票自动热榜：服务端每小时定向刷新，近 7 日、强相关、两星以上、每只最多 20 条",
+    groups
+  };
 }
 
 async function fetchWatchedNewsGroups() {
@@ -253,9 +287,12 @@ async function fetchPreciseStockNewsGroup(target) {
         .catch(() => [])
     );
   }
-  const query = `${target.query} when:7d`;
-  const googleUrl = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans`;
-  feeds.push(fetchText(googleUrl, 9000).then((xml) => parseRssItems(xml)).catch(() => []));
+  if (Array.isArray(target.rssFeeds)) {
+    for (const feed of target.rssFeeds) {
+      feeds.push(fetchText(feed.url, 9000, { "User-Agent": "Mozilla/5.0" }).then((xml) => parseRssItems(xml, feed.source)).catch(() => []));
+    }
+  }
+  if (!feeds.length) return { ...target, source: "no-direct-feed", items: [] };
 
   const feedItems = (await Promise.all(feeds)).flat();
   const seen = new Set();
@@ -279,7 +316,7 @@ async function fetchPreciseStockNewsGroup(target) {
     group: target.group,
     type: target.type,
     aliases: target.names.join(" "),
-    source: "google-news-rss",
+    source: target.yahooSymbol ? "yahoo-finance-rss" : "direct-feed",
     items
   };
 }

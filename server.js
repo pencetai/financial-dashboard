@@ -114,7 +114,7 @@ async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/watchlist") return sendJson(res, 200, { watchlist: readStore().watchlist });
   if (req.method === "POST" && url.pathname === "/api/watchlist") return updateWatchlist(req, res);
   if (req.method === "POST" && url.pathname === "/api/news/search") return searchNews(req, res);
-  if (req.method === "POST" && url.pathname === "/api/strategy/hot-money") return sendJson(res, 200, { generatedAt: new Date().toISOString(), candidates: hotMoneyCandidates });
+  if (req.method === "POST" && url.pathname === "/api/strategy/hot-money") return hotMoneyStrategy(res);
   sendJson(res, 404, { error: "not_found" });
 }
 
@@ -153,17 +153,117 @@ async function searchNews(req, res) {
   }
 
   store.usage[today][userKey].newsSearches += 1;
-  const groups = localNewsSearch(keyword);
+  const remoteGroups = await fetchGoogleNewsGroups(keyword).catch(() => []);
+  const groups = remoteGroups.length ? remoteGroups : localNewsSearch(keyword);
   const payload = {
     keyword,
     generatedAt: new Date().toISOString(),
-    source: "mock-codex-search",
+    source: remoteGroups.length ? "google-news-rss" : "mock-codex-search",
     rule: "近 7 日、两星及以上、按重要性排序，最多 20 条",
     groups
   };
   store.newsCache[cacheKey] = { savedAt: Date.now(), payload };
   writeStore(store);
   sendJson(res, 200, { ...payload, cache: "miss", remaining: limit - store.usage[today][userKey].newsSearches });
+}
+
+async function hotMoneyStrategy(res) {
+  const candidates = await fetchEastmoneyHotMoneyCandidates().catch(() => []);
+  sendJson(res, 200, {
+    generatedAt: new Date().toISOString(),
+    source: candidates.length ? "eastmoney-lhb" : "mock-hot-money",
+    candidates: candidates.length ? candidates : hotMoneyCandidates
+  });
+}
+
+async function fetchGoogleNewsGroups(keyword) {
+  const query = `${keyword} 股票 OR 财报 OR 订单 OR 资金 OR 政策 when:7d`;
+  const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans`;
+  const xml = await fetchText(url, 8000);
+  const items = parseRssItems(xml)
+    .slice(0, 20)
+    .map((item, index) => {
+      const importance = scoreNewsImportance(item, index);
+      return {
+        id: `remote-${crypto.createHash("md5").update(item.link || item.title).digest("hex").slice(0, 10)}`,
+        title: item.title,
+        time: formatRelativeTime(item.pubDate),
+        daysAgo: daysAgo(item.pubDate),
+        importance,
+        summary: item.source ? `来源：${item.source}` : "联网搜索结果，等待 Codex 进一步摘要。",
+        detail: item.description || item.title,
+        analysis: "测试版先根据关键词、来源和时间进行重要性排序；后续接入 Codex 后，会生成更完整的影响路径和风险解释。",
+        impact: importance >= 90 ? "高度关注" : importance >= 70 ? "值得关注" : "一般关注",
+        url: item.link
+      };
+    })
+    .filter((item) => item.daysAgo <= 7 && importanceStars(item.importance) >= 2)
+    .sort((a, b) => b.importance - a.importance)
+    .slice(0, 20);
+
+  if (!items.length) return [];
+  return [
+    {
+      id: `remote-${crypto.createHash("md5").update(keyword).digest("hex").slice(0, 8)}`,
+      title: keyword,
+      meta: "近 7 日联网新闻",
+      group: "remote",
+      type: "stock",
+      aliases: keyword,
+      items
+    }
+  ];
+}
+
+async function fetchEastmoneyHotMoneyCandidates() {
+  const end = new Date();
+  const start = new Date(end.getTime() - 14 * 24 * 60 * 60 * 1000);
+  const filter = `(TRADE_DATE>='${formatDate(start)}')(TRADE_DATE<='${formatDate(end)}')`;
+  const url = new URL("https://datacenter-web.eastmoney.com/api/data/v1/get");
+  url.searchParams.set("reportName", "RPT_DAILYBILLBOARD_DETAILS");
+  url.searchParams.set("columns", "SECURITY_CODE,SECUCODE,SECURITY_NAME_ABBR,TRADE_DATE,EXPLAIN,BILLBOARD_NET_AMT,BILLBOARD_BUY_AMT,BILLBOARD_SELL_AMT,CHANGE_RATE,TURNOVERRATE");
+  url.searchParams.set("sortColumns", "TRADE_DATE,BILLBOARD_NET_AMT");
+  url.searchParams.set("sortTypes", "-1,-1");
+  url.searchParams.set("pageSize", "80");
+  url.searchParams.set("pageNumber", "1");
+  url.searchParams.set("filter", filter);
+  const payload = await fetchJson(url.toString(), 9000, {
+    Referer: "https://data.eastmoney.com/",
+    "User-Agent": "Mozilla/5.0"
+  });
+  const rows = payload?.result?.data || [];
+  const merged = new Map();
+  for (const row of rows) {
+    const code = row.SECURITY_CODE || row.SECUCODE || "";
+    if (!code) continue;
+    const current = merged.get(code) || {
+      name: row.SECURITY_NAME_ABBR || code,
+      symbol: code,
+      theme: row.EXPLAIN || "龙虎榜",
+      net: 0,
+      count: 0,
+      change: Number(row.CHANGE_RATE || 0),
+      turnover: Number(row.TURNOVERRATE || 0)
+    };
+    current.net += Number(row.BILLBOARD_NET_AMT || 0);
+    current.count += 1;
+    current.change = Math.max(current.change, Number(row.CHANGE_RATE || 0));
+    current.turnover = Math.max(current.turnover, Number(row.TURNOVERRATE || 0));
+    merged.set(code, current);
+  }
+  return [...merged.values()]
+    .sort((a, b) => b.net - a.net || b.count - a.count)
+    .slice(0, 10)
+    .map((item, index) => ({
+      rank: index + 1,
+      name: item.name,
+      symbol: item.symbol,
+      theme: item.theme,
+      funds: "龙虎榜活跃资金",
+      score: Math.max(60, Math.min(99, Math.round(70 + item.count * 4 + Math.min(item.turnover, 20) / 2))),
+      signal: `近两周上榜 ${item.count} 次，榜单净额约 ${formatMoney(item.net)}`,
+      risk: item.change > 8 ? "高位波动" : "持续性待验证"
+    }));
 }
 
 function localNewsSearch(keyword) {
@@ -288,6 +388,88 @@ function readStore() {
 
 function writeStore(store) {
   fs.writeFileSync(STORE_FILE, JSON.stringify(store, null, 2));
+}
+
+async function fetchText(url, timeoutMs, headers = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { headers, signal: controller.signal });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return await response.text();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchJson(url, timeoutMs, headers = {}) {
+  const text = await fetchText(url, timeoutMs, headers);
+  return JSON.parse(text);
+}
+
+function parseRssItems(xml) {
+  const itemMatches = xml.match(/<item>[\s\S]*?<\/item>/g) || [];
+  return itemMatches.map((raw) => ({
+    title: decodeXml(readXml(raw, "title")),
+    link: decodeXml(readXml(raw, "link")),
+    pubDate: decodeXml(readXml(raw, "pubDate")),
+    source: decodeXml(readXml(raw, "source")),
+    description: stripHtml(decodeXml(readXml(raw, "description")))
+  }));
+}
+
+function readXml(raw, tag) {
+  const match = raw.match(new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`, "i"));
+  return match ? match[1].replace(/^<!\[CDATA\[/, "").replace(/\]\]>$/, "") : "";
+}
+
+function decodeXml(value) {
+  return value
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, "\"")
+    .replace(/&#39;/g, "'");
+}
+
+function stripHtml(value) {
+  return value.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function scoreNewsImportance(item, index) {
+  const text = `${item.title} ${item.description}`;
+  let score = Math.max(45, 95 - index * 4);
+  if (/财报|业绩|订单|监管|制裁|降息|加息|央行|并购|停牌|涨停|龙虎榜/.test(text)) score += 10;
+  if (/传闻|小幅|观点|评论/.test(text)) score -= 8;
+  return Math.max(20, Math.min(98, score));
+}
+
+function daysAgo(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return 0;
+  return Math.max(0, Math.floor((Date.now() - date.getTime()) / 86_400_000));
+}
+
+function formatRelativeTime(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "刚刚";
+  const diff = Date.now() - date.getTime();
+  const minutes = Math.max(1, Math.floor(diff / 60_000));
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  return `${Math.floor(hours / 24)} 天前`;
+}
+
+function formatDate(date) {
+  return date.toISOString().slice(0, 10);
+}
+
+function formatMoney(value) {
+  const abs = Math.abs(value);
+  if (abs >= 100_000_000) return `${(value / 100_000_000).toFixed(2)} 亿`;
+  if (abs >= 10_000) return `${(value / 10_000).toFixed(0)} 万`;
+  return `${value.toFixed(0)}`;
 }
 
 function importanceStars(importance) {

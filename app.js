@@ -212,6 +212,9 @@ const strategies = [
 ];
 
 let activeStrategyId = "hot-money";
+let hotMoneyApiCandidates = null;
+let hotMoneySource = "";
+let isLoadingHotMoney = false;
 
 const viewCopy = {
   monitor: { eyebrow: "多市场实时工作台", title: "全球金融监控" },
@@ -584,6 +587,7 @@ function renderStrategy() {
     "优先选择题材辨识度高、成交额充足、席位重复参与、板块联动强的股票。",
     "剔除一日游、缩量冲高、仅靠单一消息刺激且无资金延续的标的。"
   ];
+  const candidates = hotMoneyApiCandidates || hotMoneyCandidates;
 
   strategyOutput.innerHTML = `
     <div class="strategy-card">
@@ -592,7 +596,7 @@ function renderStrategy() {
       <ul>${trackingRules.map((rule) => `<li>${rule}</li>`).join("")}</ul>
     </div>
     <div class="strategy-card">
-      <strong>游资活跃股票 Top 10</strong>
+      <strong>游资活跃股票 Top 10 <span class="scope-pill">${isLoadingHotMoney ? "加载中" : hotMoneySource || "备用数据"}</span></strong>
       <div class="hot-money-table">
         <div class="hot-money-row hot-money-head">
           <span>排名</span>
@@ -602,7 +606,7 @@ function renderStrategy() {
           <span>热度</span>
           <span>风险</span>
         </div>
-        ${hotMoneyCandidates
+        ${candidates
           .map(
             (item) => `
               <div class="hot-money-row">
@@ -629,6 +633,25 @@ function renderStrategy() {
   `;
 }
 
+async function loadHotMoneyStrategy() {
+  if (activeStrategyId !== "hot-money") return;
+  isLoadingHotMoney = true;
+  renderStrategy();
+  try {
+    const payload = await apiFetchJson("/api/strategy/hot-money", { method: "POST", body: JSON.stringify({}) });
+    if (Array.isArray(payload.candidates) && payload.candidates.length) {
+      hotMoneyApiCandidates = payload.candidates;
+      hotMoneySource = payload.source === "eastmoney-lhb" ? "龙虎榜数据" : "备用数据";
+    }
+  } catch {
+    hotMoneyApiCandidates = null;
+    hotMoneySource = "备用数据";
+  } finally {
+    isLoadingHotMoney = false;
+    renderStrategy();
+  }
+}
+
 function renderStrategyCards() {
   strategyCards.innerHTML = strategies
     .map(
@@ -650,6 +673,7 @@ function renderStrategyCards() {
       activeStrategyId = card.dataset.strategyId;
       renderStrategyCards();
       renderStrategy();
+      loadHotMoneyStrategy();
     });
   });
 }
@@ -739,6 +763,7 @@ renderNews();
 renderWatchCards();
 renderStrategyCards();
 renderStrategy();
+loadHotMoneyStrategy();
 updateSearchStatus();
 showSection(["monitor", "watch", "strategy"].includes(location.hash.slice(1)) ? location.hash.slice(1) : "monitor");
 setInterval(loadMarketOverview, 60_000);

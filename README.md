@@ -136,8 +136,18 @@ sudo systemctl reload nginx
 
 建议顺序：
 
-1. 用免费行情源替换 `/api/market/overview` 的模拟数据。
-2. 给行情接口加缓存和更新时间。
-3. 用真实搜索/Codex 替换 `/api/news/search`。
+1. 关注新闻：`/api/news/search` 已优先尝试 Google News RSS 近 7 日搜索，失败时回退模拟数据。
+2. 选股策略：`/api/strategy/hot-money` 已优先尝试公开龙虎榜数据，失败时回退模拟游资数据。
+3. 行情监控：后续再用免费行情源替换 `/api/market/overview`。
 4. 把 `data/store.json` 换成 SQLite 或 PostgreSQL。
 5. 完善登录、用户关注列表和搜索次数限制。
+
+返回字段中的 `source` 可以判断数据来源：
+
+```text
+google-news-rss      新闻来自联网 RSS
+eastmoney-lhb        游资策略来自公开龙虎榜数据
+mock-codex-search    新闻回退到模拟数据
+mock-hot-money       游资策略回退到模拟数据
+mock-cache           行情仍是模拟缓存
+```

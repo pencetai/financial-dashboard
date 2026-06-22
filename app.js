@@ -528,7 +528,7 @@ function renderNews() {
                         <span class="news-rank">${index + 1}</span>
                         <span>
                           <strong>${item.title}</strong>
-                          <small>${group.title} · ${item.time} · ${renderStars(item.importance)}</small>
+                          <small>${group.title} · ${item.time} · ${formatAnalyzedTime(item.analyzedAt)} · ${renderStars(item.importance)}</small>
                         </span>
                         <em>${item.impact}</em>
                       </button>
@@ -556,9 +556,20 @@ function renderNews() {
   }
 }
 
+function formatAnalyzedTime(value) {
+  if (!value) return "分析时间：本轮缓存";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "分析时间：本轮缓存";
+  return `分析 ${date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`;
+}
+
 function renderNewsDetail(group, item) {
   return `
     <div class="inline-news-detail">
+      <section>
+        <strong>最后分析时间</strong>
+        <p>${formatAnalyzedTime(item.analyzedAt)}。新闻重要性会随时间衰减，越新的事件排序权重越高。</p>
+      </section>
       <section>
         <strong>详细新闻</strong>
         <p>${item.detail}</p>

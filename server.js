@@ -261,7 +261,8 @@ function buildWatchNewsPayload(remoteGroups, reason) {
   );
   const groups = defaultWatchTargets
     .map((target) => remoteById.get(target.id) || fallbackById.get(target.id))
-    .filter(Boolean);
+    .filter(Boolean)
+    .map((group) => normalizeNewsGroupForCache(group));
   return {
     generatedAt: new Date().toISOString(),
     source: remoteGroups.length === defaultWatchTargets.length ? "scheduled-watch-feeds" : remoteGroups.length ? "mixed-scheduled-watch-feeds" : "mock-watch-news",
@@ -627,16 +628,20 @@ function scoreNewsImportance(item, index) {
   if (/产业链|供应链|新品|发布会|AI|算力|芯片|光模块|CPO|数据中心/.test(text)) score += 6;
   if (/华尔街见闻|财联社|证券时报|中国证券报|上海证券报|路透|彭博|Reuters|Bloomberg|CNBC|MarketWatch|Barron/.test(text)) score += 6;
   if (/传闻|小幅|观点|评论|专栏|值得买吗|预测|forecast|prediction/i.test(text)) score -= 18;
+  score -= newsFreshnessDecay(item);
   return Math.max(20, Math.min(98, score));
 }
 
 function buildRemoteNewsItem(item, keyword, index) {
+  const analyzedAt = new Date().toISOString();
   const importance = scoreNewsImportance(item, index);
   const brief = buildNewsBrief(item, keyword, importance);
   return {
     id: `remote-${crypto.createHash("md5").update(item.link || item.title).digest("hex").slice(0, 10)}`,
     title: item.title,
     time: formatRelativeTime(item.pubDate),
+    publishedAt: parseDateIso(item.pubDate),
+    analyzedAt,
     daysAgo: daysAgo(item.pubDate),
     importance,
     summary: brief.summary,
@@ -644,6 +649,27 @@ function buildRemoteNewsItem(item, keyword, index) {
     analysis: brief.analysis,
     impact: brief.impact,
     url: item.link
+  };
+}
+
+function applyFreshnessToNewsItem(item, index = 0) {
+  const analyzedAt = new Date().toISOString();
+  const ageDays = Number.isFinite(Number(item.daysAgo)) ? Number(item.daysAgo) : 0;
+  const decay = Math.min(42, ageDays * 8 + Math.floor(index / 4) * 2);
+  return {
+    ...item,
+    analyzedAt: item.analyzedAt || analyzedAt,
+    importance: Math.max(20, Math.min(98, Number(item.importance || 50) - decay))
+  };
+}
+
+function normalizeNewsGroupForCache(group) {
+  return {
+    ...group,
+    items: (group.items || [])
+      .map((item, index) => applyFreshnessToNewsItem(item, index))
+      .sort((a, b) => b.importance - a.importance)
+      .slice(0, 20)
   };
 }
 
@@ -673,6 +699,28 @@ function detectNewsTrigger(text) {
     { pattern: /AI|算力|芯片|光模块|CPO|数据中心|新品|发布会/, label: "产业催化", impact: "偏利于主题热度和估值弹性，但要防止预期已经提前交易。" }
   ];
   return rules.find((rule) => rule.pattern.test(text)) || { label: "市场关注事件", impact: "先作为观察项处理，等待更多来源确认影响方向。" };
+}
+
+function newsFreshnessDecay(item) {
+  const hours = newsAgeHours(item.pubDate);
+  if (!Number.isFinite(hours)) return 8;
+  if (hours <= 1) return 0;
+  if (hours <= 3) return 2;
+  if (hours <= 6) return 4;
+  if (hours <= 12) return 7;
+  if (hours <= 24) return 10;
+  return Math.min(42, 10 + Math.floor((hours - 24) / 24) * 8);
+}
+
+function newsAgeHours(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return NaN;
+  return Math.max(0, (Date.now() - date.getTime()) / 3_600_000);
+}
+
+function parseDateIso(value) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "" : date.toISOString();
 }
 
 function keywordMatchesNews(text, keyword) {

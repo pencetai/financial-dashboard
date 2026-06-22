@@ -9,6 +9,38 @@ const DATA_DIR = path.join(ROOT, "data");
 const STORE_FILE = path.join(DATA_DIR, "store.json");
 const sessions = new Map();
 
+const defaultWatchTargets = [
+  {
+    id: "zhongji",
+    title: "中际旭创",
+    meta: "300308 · A 股 · CPO/光模块",
+    group: "cn",
+    type: "stock",
+    names: ["中际旭创", "300308"],
+    query: "中际旭创 300308 财报 OR 业绩 OR 订单 OR 光模块 OR CPO OR 算力 OR 机构 OR 证券"
+  },
+  {
+    id: "nvidia",
+    title: "NVIDIA",
+    meta: "NVDA · 美股 · AI 芯片",
+    group: "us",
+    type: "stock",
+    names: ["NVIDIA", "Nvidia", "NVDA", "英伟达"],
+    yahooSymbol: "NVDA",
+    query: "NVIDIA OR NVDA OR 英伟达 earnings OR revenue OR guidance OR AI chip OR data center OR analyst OR Reuters OR CNBC"
+  },
+  {
+    id: "tesla",
+    title: "Tesla",
+    meta: "TSLA · 美股 · 智能汽车",
+    group: "us",
+    type: "stock",
+    names: ["Tesla", "TSLA", "特斯拉"],
+    yahooSymbol: "TSLA",
+    query: "Tesla OR TSLA OR 特斯拉 deliveries OR earnings OR margin OR robotaxi OR FSD OR analyst OR Reuters OR CNBC"
+  }
+];
+
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
   ".css": "text/css; charset=utf-8",
@@ -112,6 +144,7 @@ async function handleApi(req, res, url) {
   if (req.method === "POST" && url.pathname === "/api/auth/logout") return logout(req, res);
   if (req.method === "GET" && url.pathname === "/api/market/overview") return marketOverview(res);
   if (req.method === "GET" && url.pathname === "/api/watchlist") return sendJson(res, 200, { watchlist: readStore().watchlist });
+  if (req.method === "GET" && url.pathname === "/api/watch/news") return watchNewsOverview(res);
   if (req.method === "POST" && url.pathname === "/api/watchlist") return updateWatchlist(req, res);
   if (req.method === "POST" && url.pathname === "/api/news/search") return searchNews(req, res);
   if (req.method === "POST" && url.pathname === "/api/strategy/hot-money") return hotMoneyStrategy(res);
@@ -167,6 +200,34 @@ async function searchNews(req, res) {
   sendJson(res, 200, { ...payload, cache: "miss", remaining: limit - store.usage[today][userKey].newsSearches });
 }
 
+async function watchNewsOverview(res) {
+  const store = readStore();
+  const cacheKey = "watch:auto:v6";
+  const cached = store.newsCache[cacheKey];
+  const ttlMs = 30 * 60 * 1000;
+  if (cached && Date.now() - cached.savedAt < ttlMs) {
+    return sendJson(res, 200, { ...cached.payload, cache: "hit" });
+  }
+
+  const remoteGroups = await fetchWatchedNewsGroups().catch(() => []);
+  const fallbackIds = new Set(defaultWatchTargets.map((target) => target.id));
+  const remoteById = new Map(remoteGroups.map((group) => [group.id, group]));
+  const fallbackById = new Map(watchGroups.filter((group) => fallbackIds.has(group.id)).map((group) => [group.id, group]));
+  const groups = defaultWatchTargets
+    .map((target) => remoteById.get(target.id) || fallbackById.get(target.id))
+    .filter(Boolean);
+  const payload = {
+    generatedAt: new Date().toISOString(),
+    source: remoteGroups.length === defaultWatchTargets.length ? "google-news-rss-watch" : remoteGroups.length ? "mixed-watch-news" : "mock-watch-news",
+    rule: "已关注股票自动热榜：近 7 日、强相关、两星以上、每只最多 20 条",
+    groups
+  };
+
+  store.newsCache[cacheKey] = { savedAt: Date.now(), payload };
+  writeStore(store);
+  sendJson(res, 200, { ...payload, cache: "miss" });
+}
+
 async function hotMoneyStrategy(res) {
   const candidates = await fetchEastmoneyHotMoneyCandidates().catch(() => []);
   sendJson(res, 200, {
@@ -174,6 +235,53 @@ async function hotMoneyStrategy(res) {
     source: candidates.length ? "eastmoney-lhb" : "mock-hot-money",
     candidates: candidates.length ? candidates : hotMoneyCandidates
   });
+}
+
+async function fetchWatchedNewsGroups() {
+  const groups = await Promise.all(defaultWatchTargets.map((target) => fetchPreciseStockNewsGroup(target).catch(() => null)));
+  return groups.filter((group) => group && group.items.length);
+}
+
+async function fetchPreciseStockNewsGroup(target) {
+  const feeds = [];
+  if (target.yahooSymbol) {
+    feeds.push(
+      fetchText(`https://feeds.finance.yahoo.com/rss/2.0/headline?s=${encodeURIComponent(target.yahooSymbol)}&region=US&lang=en-US`, 9000, {
+        "User-Agent": "Mozilla/5.0"
+      })
+        .then((xml) => parseRssItems(xml, "Yahoo Finance"))
+        .catch(() => [])
+    );
+  }
+  const query = `${target.query} when:7d`;
+  const googleUrl = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans`;
+  feeds.push(fetchText(googleUrl, 9000).then((xml) => parseRssItems(xml)).catch(() => []));
+
+  const feedItems = (await Promise.all(feeds)).flat();
+  const seen = new Set();
+  const items = feedItems
+    .filter((item) => {
+      const key = normalizeText(item.title).toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return isUsefulTargetNews(item, target);
+    })
+    .slice(0, 40)
+    .map((item, index) => buildRemoteNewsItem(item, target.title, index))
+    .filter((item) => item.daysAgo <= 7 && importanceStars(item.importance) >= 2)
+    .sort((a, b) => b.importance - a.importance)
+    .slice(0, 20);
+
+  return {
+    id: target.id,
+    title: target.title,
+    meta: `${target.meta} · 近 7 日真实新闻`,
+    group: target.group,
+    type: target.type,
+    aliases: target.names.join(" "),
+    source: "google-news-rss",
+    items
+  };
 }
 
 async function fetchGoogleNewsGroups(keyword) {
@@ -184,20 +292,7 @@ async function fetchGoogleNewsGroups(keyword) {
     .filter((item) => isUsefulNews(item, keyword))
     .slice(0, 40)
     .map((item, index) => {
-      const importance = scoreNewsImportance(item, index);
-      const brief = buildNewsBrief(item, keyword, importance);
-      return {
-        id: `remote-${crypto.createHash("md5").update(item.link || item.title).digest("hex").slice(0, 10)}`,
-        title: item.title,
-        time: formatRelativeTime(item.pubDate),
-        daysAgo: daysAgo(item.pubDate),
-        importance,
-        summary: brief.summary,
-        detail: brief.detail,
-        analysis: brief.analysis,
-        impact: brief.impact,
-        url: item.link
-      };
+      return buildRemoteNewsItem(item, keyword, index);
     })
     .filter((item) => item.daysAgo <= 7 && importanceStars(item.importance) >= 2)
     .sort((a, b) => b.importance - a.importance)
@@ -376,7 +471,7 @@ function sendText(res, status, text) {
 function ensureStore() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
   if (!fs.existsSync(STORE_FILE)) {
-    writeStore({ watchlist: ["中际旭创", "NVIDIA", "外围与宏观", "贵州茅台", "宁德时代", "Tesla", "Apple", "黄金"], newsCache: {}, usage: {} });
+    writeStore({ watchlist: ["中际旭创", "NVIDIA", "Tesla"], newsCache: {}, usage: {} });
   }
 }
 
@@ -409,13 +504,13 @@ async function fetchJson(url, timeoutMs, headers = {}) {
   return JSON.parse(text);
 }
 
-function parseRssItems(xml) {
+function parseRssItems(xml, defaultSource = "") {
   const itemMatches = xml.match(/<item>[\s\S]*?<\/item>/g) || [];
   return itemMatches.map((raw) => ({
     title: decodeXml(readXml(raw, "title")),
     link: decodeXml(readXml(raw, "link")),
     pubDate: decodeXml(readXml(raw, "pubDate")),
-    source: decodeXml(readXml(raw, "source")),
+    source: decodeXml(readXml(raw, "source")) || defaultSource,
     description: stripHtml(decodeXml(readXml(raw, "description")))
   }));
 }
@@ -447,9 +542,13 @@ function isUsefulNews(item, keyword) {
   if (daysAgo(item.pubDate) > 7) return false;
   if (!keywordMatchesNews(text, keyword)) return false;
 
+  return passesNewsQualityGate(text);
+}
+
+function passesNewsQualityGate(text) {
   const noisyPatterns = [
     /股价预测|价格预测|股票价格预测|走势预测|目标价预测|未来[0-9]{4}.*预测|[0-9]{4}.*[0-9]{4}.*预测/,
-    /price forecast|stock forecast|price prediction|stock prediction|target price prediction|预测.*2030/i,
+    /price forecast|stock forecast|price prediction|stock prediction|target price prediction|screaming buy|massive gains|best .*stocks? to invest|bull and bear|prediction markets|预测.*2030/i,
     /如何购买|怎么买|值得买吗|能买吗|投资指南|新手指南|开户|交易教程/,
     /加密货币|彩票|博彩|返利|优惠券|下载/
   ];
@@ -460,6 +559,24 @@ function isUsefulNews(item, keyword) {
   if (weakPatterns.some((pattern) => pattern.test(text)) && !hasHardSignal) return false;
 
   return true;
+}
+
+function isUsefulTargetNews(item, target) {
+  const title = normalizeText(item.title);
+  const text = normalizeText(`${item.title} ${item.description} ${item.source}`);
+  if (!text) return false;
+  if (daysAgo(item.pubDate) > 7) return false;
+  if (!target.names.some((name) => title.toLowerCase().includes(name.toLowerCase()))) return false;
+  if (/fool\.com|247wallst\.com|stocktwits\.com|benzinga\.com/i.test(item.link || "")) return false;
+
+  const unrelatedCompanyPatterns = target.id === "nvidia"
+    ? [/NVIDIA Shield/i, /GeForce Now/i]
+    : target.id === "tesla"
+    ? [/Tesla Model.*二手|特斯拉二手|车主投诉|充电桩故障/]
+    : [];
+  if (unrelatedCompanyPatterns.some((pattern) => pattern.test(text))) return false;
+
+  return passesNewsQualityGate(text);
 }
 
 function scoreNewsImportance(item, index) {
@@ -474,6 +591,23 @@ function scoreNewsImportance(item, index) {
   if (/华尔街见闻|财联社|证券时报|中国证券报|上海证券报|路透|彭博|Reuters|Bloomberg|CNBC|MarketWatch|Barron/.test(text)) score += 6;
   if (/传闻|小幅|观点|评论|专栏|值得买吗|预测|forecast|prediction/i.test(text)) score -= 18;
   return Math.max(20, Math.min(98, score));
+}
+
+function buildRemoteNewsItem(item, keyword, index) {
+  const importance = scoreNewsImportance(item, index);
+  const brief = buildNewsBrief(item, keyword, importance);
+  return {
+    id: `remote-${crypto.createHash("md5").update(item.link || item.title).digest("hex").slice(0, 10)}`,
+    title: item.title,
+    time: formatRelativeTime(item.pubDate),
+    daysAgo: daysAgo(item.pubDate),
+    importance,
+    summary: brief.summary,
+    detail: brief.detail,
+    analysis: brief.analysis,
+    impact: brief.impact,
+    url: item.link
+  };
 }
 
 function buildNewsBrief(item, keyword, importance) {

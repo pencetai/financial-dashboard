@@ -162,7 +162,7 @@ const extraWatchGroups = [
 
 watchGroups.push(...extraWatchGroups);
 
-const watchlist = ["中际旭创", "NVIDIA", "外围与宏观", "贵州茅台", "宁德时代", "Tesla", "Apple", "黄金"];
+const watchlist = ["中际旭创", "NVIDIA", "Tesla"];
 let activeMarket = "all";
 let activeNewsId = "macro-1";
 let activeWatchGroupId = "zhongji";
@@ -170,6 +170,8 @@ let expandedNewsId = "";
 let remoteSearchResults = null;
 let remoteSearchKeyword = "";
 let isSearchingNews = false;
+let isLoadingWatchNews = false;
+let watchNewsSource = "备用数据";
 
 const hotMoneyCandidates = [
   { rank: 1, name: "中际旭创", symbol: "300308", theme: "CPO/算力", funds: "章盟主、作手新一、机构席位", score: 96, signal: "多席位反复参与，板块辨识度高", risk: "高位波动" },
@@ -282,7 +284,7 @@ function visibleAssets() {
 }
 
 function visibleNewsGroups() {
-  const groups = watchGroups.filter((group) => activeMarket === "all" || group.group === activeMarket || group.group === "global");
+  const groups = selectedWatchGroups().filter((group) => activeMarket === "all" || group.group === activeMarket || group.group === "global");
 
   if (remoteSearchResults) {
     return remoteSearchResults;
@@ -295,6 +297,11 @@ function visibleNewsGroups() {
       items: group.items.filter((item) => importanceStars(item.importance) >= 2)
     }))
     .filter((group) => group.items.length > 0);
+}
+
+function selectedWatchGroups() {
+  const selected = new Set(watchlist.map((item) => item.toLowerCase()));
+  return watchGroups.filter((group) => selected.has(group.title.toLowerCase()) || selected.has((group.meta || "").split("·")[0].trim().toLowerCase()));
 }
 
 function findNewsItem(id = activeNewsId) {
@@ -386,11 +393,18 @@ function updateSearchStatus() {
     watchSearchStatus.textContent = `测试结果：已按两星以上规则筛出 ${count} 条近 7 日新闻。后续这里会调用 Codex 联网搜索。`;
     return;
   }
-  watchSearchStatus.textContent = "测试版使用模拟联网结果，后续接入 Codex 搜索与分析。";
+  watchSearchStatus.textContent = isLoadingWatchNews
+    ? "正在自动获取已关注股票的近 7 日真实新闻热榜..."
+    : `关注热榜来源：${watchNewsSource}。搜索框仅作为临时补充入口。`;
 }
 
 function groupTopNews(group) {
-  return [...group.items].sort((a, b) => b.importance - a.importance)[0];
+  return [...(group.items || [])].sort((a, b) => b.importance - a.importance)[0] || {
+    id: `${group.id}-empty`,
+    title: "暂无两星以上新闻",
+    importance: 20,
+    impact: "等待更多消息"
+  };
 }
 
 async function apiFetchJson(path, options = {}) {
@@ -414,6 +428,31 @@ async function loadMarketOverview() {
   }
   renderMarketRows();
   updateIndexCards();
+}
+
+async function loadWatchNews() {
+  isLoadingWatchNews = true;
+  updateSearchStatus();
+  renderWatchCards();
+  renderNews();
+  try {
+    const payload = await apiFetchJson("/api/watch/news");
+    if (Array.isArray(payload.groups) && payload.groups.length) {
+      watchGroups.splice(0, watchGroups.length, ...payload.groups);
+      activeWatchGroupId = watchGroups.some((group) => group.id === activeWatchGroupId) ? activeWatchGroupId : watchGroups[0].id;
+      const group = watchGroups.find((item) => item.id === activeWatchGroupId) || watchGroups[0];
+      activeNewsId = groupTopNews(group).id;
+      watchNewsSource =
+        payload.source === "google-news-rss-watch" ? "真实联网新闻" : payload.source === "mixed-watch-news" ? "真实新闻 + 备用数据" : "备用数据";
+    }
+  } catch {
+    watchNewsSource = "备用数据";
+  } finally {
+    isLoadingWatchNews = false;
+    renderWatchCards();
+    renderNews();
+    updateSearchStatus();
+  }
 }
 
 function renderMarketRows() {
@@ -531,7 +570,7 @@ function renderNewsDetail(group, item) {
 }
 
 function renderWatchCards() {
-  watchCards.innerHTML = watchGroups
+  watchCards.innerHTML = selectedWatchGroups()
     .map((group) => {
       const top = groupTopNews(group);
       const isActive = group.id === activeWatchGroupId && !watchSearch.value.trim();
@@ -556,7 +595,7 @@ function renderWatchCards() {
       clearRemoteSearch();
       activeWatchGroupId = card.dataset.groupId;
       watchSearch.value = "";
-      const group = watchGroups.find((item) => item.id === activeWatchGroupId);
+      const group = selectedWatchGroups().find((item) => item.id === activeWatchGroupId);
       activeNewsId = groupTopNews(group).id;
       renderWatchCards();
       renderNews();
@@ -759,6 +798,7 @@ watchSearch.addEventListener("keydown", (event) => {
 });
 
 loadMarketOverview();
+loadWatchNews();
 renderNews();
 renderWatchCards();
 renderStrategyCards();

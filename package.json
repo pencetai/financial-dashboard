@@ -1,0 +1,12 @@
+{
+  "name": "financial-dashboard",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Financial dashboard prototype with static UI and lightweight API server.",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -345,15 +345,24 @@ function mockCodexNewsSearch(keyword) {
   renderNews();
   updateSearchStatus();
 
-  window.setTimeout(() => {
-    remoteSearchResults = localNewsSearch(keyword);
-    isSearchingNews = false;
-    activeNewsId = "";
-    expandedNewsId = "";
-    renderWatchCards();
-    renderNews();
-    updateSearchStatus();
-  }, 650);
+  apiFetchJson("/api/news/search", {
+    method: "POST",
+    body: JSON.stringify({ keyword })
+  })
+    .then((payload) => {
+      remoteSearchResults = Array.isArray(payload.groups) ? payload.groups : localNewsSearch(keyword);
+    })
+    .catch(() => {
+      remoteSearchResults = localNewsSearch(keyword);
+    })
+    .finally(() => {
+      isSearchingNews = false;
+      activeNewsId = "";
+      expandedNewsId = "";
+      renderWatchCards();
+      renderNews();
+      updateSearchStatus();
+    });
 }
 
 function clearRemoteSearch() {
@@ -379,6 +388,29 @@ function updateSearchStatus() {
 
 function groupTopNews(group) {
   return [...group.items].sort((a, b) => b.importance - a.importance)[0];
+}
+
+async function apiFetchJson(path, options = {}) {
+  const response = await fetch(path, {
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    ...options
+  });
+  if (!response.ok) throw new Error(`API ${response.status}`);
+  return response.json();
+}
+
+async function loadMarketOverview() {
+  try {
+    const payload = await apiFetchJson("/api/market/overview");
+    if (Array.isArray(payload.assets)) {
+      assets.splice(0, assets.length, ...payload.assets.map((asset) => ({ ...asset, series: undefined })));
+    }
+  } catch {
+    // Static deployment fallback keeps local mock data.
+  }
+  renderMarketRows();
+  updateIndexCards();
 }
 
 function renderMarketRows() {
@@ -679,7 +711,7 @@ document.querySelectorAll(".nav-item, .mobile-nav-item").forEach((item) => {
   });
 });
 
-document.querySelector("#refreshButton").addEventListener("click", nudgeData);
+document.querySelector("#refreshButton").addEventListener("click", loadMarketOverview);
 document.querySelector("#addWatchButton").addEventListener("click", () => {
   const value = watchSearch.value.trim();
   if (value && !watchlist.includes(value)) {
@@ -702,11 +734,11 @@ watchSearch.addEventListener("keydown", (event) => {
   }
 });
 
-renderMarketRows();
+loadMarketOverview();
 renderNews();
 renderWatchCards();
 renderStrategyCards();
 renderStrategy();
 updateSearchStatus();
 showSection(["monitor", "watch", "strategy"].includes(location.hash.slice(1)) ? location.hash.slice(1) : "monitor");
-setInterval(nudgeData, 5000);
+setInterval(loadMarketOverview, 60_000);

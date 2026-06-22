@@ -177,23 +177,25 @@ async function hotMoneyStrategy(res) {
 }
 
 async function fetchGoogleNewsGroups(keyword) {
-  const query = `${keyword} 股票 OR 财报 OR 订单 OR 资金 OR 政策 when:7d`;
+  const query = `${keyword} 股票 财报 OR 业绩 OR 订单 OR 监管 OR 政策 OR 股东大会 OR 产业链 when:7d`;
   const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans`;
   const xml = await fetchText(url, 8000);
   const items = parseRssItems(xml)
-    .slice(0, 20)
+    .filter((item) => isUsefulNews(item, keyword))
+    .slice(0, 40)
     .map((item, index) => {
       const importance = scoreNewsImportance(item, index);
+      const brief = buildNewsBrief(item, keyword, importance);
       return {
         id: `remote-${crypto.createHash("md5").update(item.link || item.title).digest("hex").slice(0, 10)}`,
         title: item.title,
         time: formatRelativeTime(item.pubDate),
         daysAgo: daysAgo(item.pubDate),
         importance,
-        summary: item.source ? `来源：${item.source}` : "联网搜索结果，等待 Codex 进一步摘要。",
-        detail: item.description || item.title,
-        analysis: "测试版先根据关键词、来源和时间进行重要性排序；后续接入 Codex 后，会生成更完整的影响路径和风险解释。",
-        impact: importance >= 90 ? "高度关注" : importance >= 70 ? "值得关注" : "一般关注",
+        summary: brief.summary,
+        detail: brief.detail,
+        analysis: brief.analysis,
+        impact: brief.impact,
         url: item.link
       };
     })
@@ -426,22 +428,99 @@ function readXml(raw, tag) {
 function decodeXml(value) {
   return value
     .replace(/&amp;/g, "&")
+    .replace(/&nbsp;/g, " ")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, "\"")
-    .replace(/&#39;/g, "'");
+    .replace(/&#39;/g, "'")
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCharCode(parseInt(code, 16)));
 }
 
 function stripHtml(value) {
   return value.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 }
 
+function isUsefulNews(item, keyword) {
+  const text = normalizeText(`${item.title} ${item.description} ${item.source}`);
+  if (!text) return false;
+  if (daysAgo(item.pubDate) > 7) return false;
+  if (!keywordMatchesNews(text, keyword)) return false;
+
+  const noisyPatterns = [
+    /股价预测|价格预测|股票价格预测|走势预测|目标价预测|未来[0-9]{4}.*预测|[0-9]{4}.*[0-9]{4}.*预测/,
+    /price forecast|stock forecast|price prediction|stock prediction|target price prediction|预测.*2030/i,
+    /如何购买|怎么买|值得买吗|能买吗|投资指南|新手指南|开户|交易教程/,
+    /加密货币|彩票|博彩|返利|优惠券|下载/
+  ];
+  if (noisyPatterns.some((pattern) => pattern.test(text))) return false;
+
+  const weakPatterns = [/观点|评论|专栏|盘前异动|盘中异动|短讯|快讯/];
+  const hasHardSignal = /财报|业绩|营收|净利|利润|指引|订单|合同|产能|交付|监管|调查|制裁|出口|禁令|并购|回购|分红|减持|增持|股东大会|发布会|新品|降息|加息|通胀|非农|CPI|PCE|关税|产业链|供应链|机构评级|上调|下调|龙虎榜|北向|资金流/.test(text);
+  if (weakPatterns.some((pattern) => pattern.test(text)) && !hasHardSignal) return false;
+
+  return true;
+}
+
 function scoreNewsImportance(item, index) {
-  const text = `${item.title} ${item.description}`;
+  const text = normalizeText(`${item.title} ${item.description} ${item.source}`);
   let score = Math.max(45, 95 - index * 4);
-  if (/财报|业绩|订单|监管|制裁|降息|加息|央行|并购|停牌|涨停|龙虎榜/.test(text)) score += 10;
-  if (/传闻|小幅|观点|评论/.test(text)) score -= 8;
+  if (/财报|业绩|营收|净利|利润|指引|订单|合同|产能|交付/.test(text)) score += 14;
+  if (/监管|调查|制裁|出口|禁令|关税|反垄断|安全审查/.test(text)) score += 14;
+  if (/降息|加息|央行|美联储|通胀|CPI|PCE|非农|美元|国债/.test(text)) score += 12;
+  if (/并购|重组|回购|分红|减持|增持|停牌|复牌|股东大会/.test(text)) score += 10;
+  if (/机构评级|上调|下调|目标价|龙虎榜|北向|资金流|成交额/.test(text)) score += 8;
+  if (/产业链|供应链|新品|发布会|AI|算力|芯片|光模块|CPO|数据中心/.test(text)) score += 6;
+  if (/华尔街见闻|财联社|证券时报|中国证券报|上海证券报|路透|彭博|Reuters|Bloomberg|CNBC|MarketWatch|Barron/.test(text)) score += 6;
+  if (/传闻|小幅|观点|评论|专栏|值得买吗|预测|forecast|prediction/i.test(text)) score -= 18;
   return Math.max(20, Math.min(98, score));
+}
+
+function buildNewsBrief(item, keyword, importance) {
+  const source = item.source || "联网新闻";
+  const title = normalizeText(item.title);
+  const description = normalizeText(item.description || title);
+  const trigger = detectNewsTrigger(`${title} ${description}`);
+  const attention = importance >= 90 ? "高" : importance >= 70 ? "中高" : "中";
+
+  return {
+    summary: `${source}｜${trigger.label}`,
+    detail: description && description !== title ? description : title,
+    analysis: `${keyword} 这条消息的核心触发点是“${trigger.label}”。当前测试版依据新闻来源、发布时间、事件类型和关键词强度排序，后续接入 Codex 后会继续补全更细的因果链和交叉验证。`,
+    impact: `${attention}关注。${trigger.impact}`
+  };
+}
+
+function detectNewsTrigger(text) {
+  const rules = [
+    { pattern: /财报|业绩|营收|净利|利润|指引/, label: "业绩与指引", impact: "优先观察收入增速、利润率和管理层展望是否改变市场预期。" },
+    { pattern: /订单|合同|产能|交付|供应链|产业链/, label: "订单与产业链", impact: "可能影响短中期景气度判断，重点看是否能转化为收入和利润。" },
+    { pattern: /监管|调查|制裁|出口|禁令|关税|反垄断/, label: "监管与政策风险", impact: "可能改变估值容忍度和资金风险偏好，需要关注后续政策细则。" },
+    { pattern: /降息|加息|央行|美联储|通胀|CPI|PCE|非农|美元|国债/, label: "宏观流动性", impact: "会影响成长股估值、汇率和跨市场风险偏好。" },
+    { pattern: /并购|重组|回购|分红|减持|增持|停牌|复牌|股东大会/, label: "资本动作", impact: "容易带来短期重估或波动，需区分一次性事件和基本面改善。" },
+    { pattern: /机构评级|上调|下调|目标价|龙虎榜|北向|资金流|成交额/, label: "资金与机构观点", impact: "对短线情绪有直接影响，但持续性需要成交量和后续消息验证。" },
+    { pattern: /AI|算力|芯片|光模块|CPO|数据中心|新品|发布会/, label: "产业催化", impact: "偏利于主题热度和估值弹性，但要防止预期已经提前交易。" }
+  ];
+  return rules.find((rule) => rule.pattern.test(text)) || { label: "市场关注事件", impact: "先作为观察项处理，等待更多来源确认影响方向。" };
+}
+
+function keywordMatchesNews(text, keyword) {
+  const normalizedText = text.toLowerCase();
+  const normalizedKeyword = normalizeText(keyword).toLowerCase();
+  if (!normalizedKeyword) return false;
+  if (normalizedText.includes(normalizedKeyword)) return true;
+
+  const tokens = normalizedKeyword
+    .split(/[\s,，/|+、·.-]+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 2 && !/^(股票|新闻|stock|news|inc|corp|ltd|公司)$/.test(token));
+
+  if (tokens.length) return tokens.some((token) => normalizedText.includes(token));
+  return fuzzyMatch(normalizedText, normalizedKeyword);
+}
+
+function normalizeText(value) {
+  return stripHtml(decodeXml(String(value || ""))).replace(/\s+/g, " ").trim();
 }
 
 function daysAgo(value) {

@@ -7,8 +7,12 @@ const PORT = Number(process.env.PORT || 3000);
 const ROOT = __dirname;
 const DATA_DIR = path.join(ROOT, "data");
 const STORE_FILE = path.join(DATA_DIR, "store.json");
-const WATCH_NEWS_CACHE_KEY = "watch:auto:scheduled:v1";
-const WATCH_NEWS_REFRESH_MS = Number(process.env.WATCH_NEWS_REFRESH_MS || 60 * 60 * 1000);
+const WATCH_NEWS_CACHE_KEY = "watch:auto:scheduled:v5";
+const WATCH_NEWS_REFRESH_MS = Number(process.env.WATCH_NEWS_REFRESH_MS || 30 * 60 * 1000);
+const WATCH_NEWS_WINDOW_MS = 24 * 60 * 60 * 1000;
+const WATCH_NEWS_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const WATCH_NEWS_MIN_ITEMS = 10;
+const WATCH_NEWS_MAX_ITEMS = 20;
 const sessions = new Map();
 let isRefreshingWatchNews = false;
 
@@ -239,10 +243,12 @@ async function refreshWatchedNewsCache(reason) {
   if (isRefreshingWatchNews) return;
   isRefreshingWatchNews = true;
   try {
-    const remoteGroups = await fetchWatchedNewsGroups().catch(() => []);
-    const payload = buildWatchNewsPayload(remoteGroups, reason);
     const store = readStore();
+    const previousPayload = store.newsCache?.[WATCH_NEWS_CACHE_KEY]?.payload;
+    const remoteGroups = await fetchWatchedNewsGroups().catch(() => []);
+    const payload = buildWatchNewsPayload(remoteGroups, reason, previousPayload);
     store.newsCache = store.newsCache || {};
+    pruneExpiredWatchNewsCaches(store);
     store.newsCache[WATCH_NEWS_CACHE_KEY] = { savedAt: Date.now(), payload };
     writeStore(store);
     console.log(`watch news refreshed: ${payload.source}, ${payload.groups.length} groups`);
@@ -251,7 +257,7 @@ async function refreshWatchedNewsCache(reason) {
   }
 }
 
-function buildWatchNewsPayload(remoteGroups, reason) {
+function buildWatchNewsPayload(remoteGroups, reason, previousPayload = null) {
   const remoteById = new Map(remoteGroups.map((group) => [group.id, group]));
   const fallbackIds = new Set(defaultWatchTargets.map((target) => target.id));
   const fallbackById = new Map(
@@ -259,16 +265,36 @@ function buildWatchNewsPayload(remoteGroups, reason) {
       .filter((group) => fallbackIds.has(group.id))
       .map((group) => [group.id, { ...group, source: "fallback-watch-data" }])
   );
+  const previousById = new Map((previousPayload?.groups || []).map((group) => [group.id, group]));
   const groups = defaultWatchTargets
-    .map((target) => remoteById.get(target.id) || fallbackById.get(target.id))
+    .map((target) => mergeWatchGroupNews(target, remoteById.get(target.id), previousById.get(target.id), fallbackById.get(target.id)))
     .filter(Boolean)
     .map((group) => normalizeNewsGroupForCache(group));
   return {
     generatedAt: new Date().toISOString(),
     source: remoteGroups.length === defaultWatchTargets.length ? "scheduled-watch-feeds" : remoteGroups.length ? "mixed-scheduled-watch-feeds" : "mock-watch-news",
     refreshReason: reason,
-    rule: "已关注股票自动热榜：服务端每小时定向刷新，近 7 日、强相关、两星以上、每只最多 20 条",
+    rule: "已关注股票自动热榜：服务端每 30 分钟定向刷新，搜寻 24 小时内新闻，7 天内缓存补足，去重后每只 10-20 条",
     groups
+  };
+}
+
+function mergeWatchGroupNews(target, remoteGroup, previousGroup, fallbackGroup) {
+  const sourceGroup = remoteGroup || fallbackGroup;
+  if (!sourceGroup) return null;
+  const now = Date.now();
+  const freshItems = (remoteGroup?.items || []).filter((item) => isWithinWindow(item.publishedAt, WATCH_NEWS_WINDOW_MS));
+  const retainedItems = (previousGroup?.items || []).filter((item) => isWithinWindow(item.publishedAt || item.analyzedAt, WATCH_NEWS_RETENTION_MS));
+  const fallbackItems = (fallbackGroup?.items || []).map((item) => ({ ...item, sourceType: "fallback" }));
+  const items = dedupeSimilarNews([...freshItems, ...retainedItems, ...fallbackItems])
+    .sort(compareWatchNews)
+    .slice(0, WATCH_NEWS_MAX_ITEMS);
+
+  return {
+    ...sourceGroup,
+    meta: remoteGroup ? sourceGroup.meta : `${target.meta} · 缓存/备用`,
+    source: remoteGroup ? sourceGroup.source : "fallback-watch-data",
+    items: items.length >= WATCH_NEWS_MIN_ITEMS ? items : items.slice(0, WATCH_NEWS_MAX_ITEMS)
   };
 }
 
@@ -296,24 +322,27 @@ async function fetchPreciseStockNewsGroup(target) {
   if (!feeds.length) return { ...target, source: "no-direct-feed", items: [] };
 
   const feedItems = (await Promise.all(feeds)).flat();
-  const seen = new Set();
-  const items = feedItems
-    .filter((item) => {
-      const key = normalizeText(item.title).toLowerCase();
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return isUsefulTargetNews(item, target);
-    })
-    .slice(0, 40)
+  const strictItems = uniqueRawNews(feedItems).filter((item) => isUsefulTargetNews(item, target));
+  const relaxedItems = uniqueRawNews(feedItems)
+    .filter((item) => !strictItems.some((strict) => normalizeText(strict.title).toLowerCase() === normalizeText(item.title).toLowerCase()))
+    .filter((item) => isSupplementalTargetNews(item, target));
+  const initialItems = [...strictItems, ...relaxedItems];
+  const retainedItems = initialItems.length >= WATCH_NEWS_MIN_ITEMS
+    ? []
+    : uniqueRawNews(feedItems)
+        .filter((item) => !initialItems.some((existing) => normalizeText(existing.title).toLowerCase() === normalizeText(item.title).toLowerCase()))
+        .filter((item) => isRetainedTargetNews(item, target));
+  const rawItems = [...initialItems, ...retainedItems].slice(0, WATCH_NEWS_MAX_ITEMS);
+  const items = rawItems
     .map((item, index) => buildRemoteNewsItem(item, target.title, index))
-    .filter((item) => item.daysAgo <= 7 && importanceStars(item.importance) >= 2)
-    .sort((a, b) => b.importance - a.importance)
-    .slice(0, 20);
+    .filter((item) => isWithinWindow(item.publishedAt, WATCH_NEWS_RETENTION_MS) && importanceStars(item.importance) >= 2)
+    .sort(compareWatchNews)
+    .slice(0, WATCH_NEWS_MAX_ITEMS);
 
   return {
     id: target.id,
     title: target.title,
-    meta: `${target.meta} · 近 7 日真实新闻`,
+    meta: `${target.meta} · 24 小时收集 / 7 天保留`,
     group: target.group,
     type: target.type,
     aliases: target.names.join(" "),
@@ -605,7 +634,6 @@ function isUsefulTargetNews(item, target) {
   if (!text) return false;
   if (daysAgo(item.pubDate) > 7) return false;
   if (!target.names.some((name) => title.toLowerCase().includes(name.toLowerCase()))) return false;
-  if (/fool\.com|247wallst\.com|stocktwits\.com|benzinga\.com/i.test(item.link || "")) return false;
 
   const unrelatedCompanyPatterns = target.id === "nvidia"
     ? [/NVIDIA Shield/i, /GeForce Now/i]
@@ -615,6 +643,26 @@ function isUsefulTargetNews(item, target) {
   if (unrelatedCompanyPatterns.some((pattern) => pattern.test(text))) return false;
 
   return passesNewsQualityGate(text);
+}
+
+function isSupplementalTargetNews(item, target) {
+  const title = normalizeText(item.title);
+  const text = normalizeText(`${item.title} ${item.description} ${item.source}`);
+  if (!target.names.some((name) => title.toLowerCase().includes(name.toLowerCase()))) return false;
+  if (!isWithinWindow(item.pubDate, WATCH_NEWS_WINDOW_MS)) return false;
+  if (/彩票|博彩|开户|交易教程|如何购买|怎么买|下载|优惠券/i.test(text)) return false;
+  if (/price forecast|stock forecast|price prediction|target price prediction|预测.*2030|未来[0-9]{4}.*预测/i.test(text)) return false;
+  return true;
+}
+
+function isRetainedTargetNews(item, target) {
+  const title = normalizeText(item.title);
+  const text = normalizeText(`${item.title} ${item.description} ${item.source}`);
+  if (!target.names.some((name) => title.toLowerCase().includes(name.toLowerCase()))) return false;
+  if (!isWithinWindow(item.pubDate, WATCH_NEWS_RETENTION_MS)) return false;
+  if (/彩票|博彩|开户|交易教程|如何购买|怎么买|下载|优惠券/i.test(text)) return false;
+  if (/price forecast|stock forecast|price prediction|target price prediction|预测.*2030|未来[0-9]{4}.*预测/i.test(text)) return false;
+  return true;
 }
 
 function scoreNewsImportance(item, index) {
@@ -627,6 +675,8 @@ function scoreNewsImportance(item, index) {
   if (/机构评级|上调|下调|目标价|龙虎榜|北向|资金流|成交额/.test(text)) score += 8;
   if (/产业链|供应链|新品|发布会|AI|算力|芯片|光模块|CPO|数据中心/.test(text)) score += 6;
   if (/华尔街见闻|财联社|证券时报|中国证券报|上海证券报|路透|彭博|Reuters|Bloomberg|CNBC|MarketWatch|Barron/.test(text)) score += 6;
+  if (/证券时报|中国证券报|上海证券报|证券日报|经济参考报|财联社|华尔街见闻|Reuters|Bloomberg|CNBC|MarketWatch|Barron|Yahoo Finance|SEC|NASDAQ|NYSE/.test(text)) score += 8;
+  if (/Motley Fool|Stocktwits|247wallst|Benzinga/i.test(text) || /fool\.com|stocktwits\.com|247wallst\.com|benzinga\.com/i.test(item.link || "")) score -= 12;
   if (/传闻|小幅|观点|评论|专栏|值得买吗|预测|forecast|prediction/i.test(text)) score -= 18;
   score -= newsFreshnessDecay(item);
   return Math.max(20, Math.min(98, score));
@@ -641,6 +691,7 @@ function buildRemoteNewsItem(item, keyword, index) {
     title: item.title,
     time: formatRelativeTime(item.pubDate),
     publishedAt: parseDateIso(item.pubDate),
+    collectedAt: analyzedAt,
     analyzedAt,
     daysAgo: daysAgo(item.pubDate),
     importance,
@@ -656,11 +707,13 @@ function applyFreshnessToNewsItem(item, index = 0) {
   const analyzedAt = new Date().toISOString();
   const ageDays = Number.isFinite(Number(item.daysAgo)) ? Number(item.daysAgo) : 0;
   const decay = Math.min(42, ageDays * 8 + Math.floor(index / 4) * 2);
-  return {
+  const next = {
     ...item,
+    collectedAt: item.collectedAt || item.analyzedAt || analyzedAt,
     analyzedAt: item.analyzedAt || analyzedAt,
     importance: Math.max(20, Math.min(98, Number(item.importance || 50) - decay))
   };
+  return { ...next, rankScore: newsRankScore(next) };
 }
 
 function normalizeNewsGroupForCache(group) {
@@ -668,8 +721,9 @@ function normalizeNewsGroupForCache(group) {
     ...group,
     items: (group.items || [])
       .map((item, index) => applyFreshnessToNewsItem(item, index))
-      .sort((a, b) => b.importance - a.importance)
-      .slice(0, 20)
+      .filter((item) => isWithinWindow(item.publishedAt || item.analyzedAt, WATCH_NEWS_RETENTION_MS))
+      .sort(compareWatchNews)
+      .slice(0, WATCH_NEWS_MAX_ITEMS)
   };
 }
 
@@ -721,6 +775,84 @@ function newsAgeHours(value) {
 function parseDateIso(value) {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? "" : date.toISOString();
+}
+
+function isWithinWindow(value, windowMs) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return false;
+  const age = Date.now() - date.getTime();
+  return age >= 0 && age <= windowMs;
+}
+
+function compareWatchNews(a, b) {
+  const scoreDiff = newsRankScore(b) - newsRankScore(a);
+  if (scoreDiff) return scoreDiff;
+  return new Date(b.publishedAt || b.analyzedAt || 0) - new Date(a.publishedAt || a.analyzedAt || 0);
+}
+
+function newsRankScore(item) {
+  const published = new Date(item.publishedAt || item.analyzedAt || 0).getTime();
+  const ageHours = Number.isFinite(published) && published > 0 ? Math.max(0, (Date.now() - published) / 3_600_000) : 168;
+  const freshness = Math.max(0, 48 - ageHours * 2);
+  const fallbackPenalty = item.sourceType === "fallback" ? 35 : 0;
+  return Number(item.importance || 0) + freshness - fallbackPenalty;
+}
+
+function dedupeSimilarNews(items) {
+  const kept = [];
+  const signatures = [];
+  for (const item of items) {
+    const signature = newsSignature(item.title || item.detail || "");
+    if (!signature) continue;
+    if (signatures.some((existing) => similarityScore(existing, signature) >= 0.72 || existing.includes(signature) || signature.includes(existing))) continue;
+    signatures.push(signature);
+    kept.push(item);
+  }
+  return kept;
+}
+
+function uniqueRawNews(items) {
+  const seen = new Set();
+  return items.filter((item) => {
+    const key = normalizeText(item.title).toLowerCase();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function newsSignature(value) {
+  return normalizeText(value)
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, "")
+    .replace(/[^\p{Script=Han}a-z0-9]+/gu, "")
+    .replace(/inc|corp|ltd|股份有限公司|有限公司|股票|新闻|快讯/g, "")
+    .slice(0, 80);
+}
+
+function similarityScore(a, b) {
+  if (!a || !b) return 0;
+  const aParts = tokenSet(a);
+  const bParts = tokenSet(b);
+  if (!aParts.size || !bParts.size) return 0;
+  let overlap = 0;
+  for (const token of aParts) {
+    if (bParts.has(token)) overlap += 1;
+  }
+  return overlap / Math.min(aParts.size, bParts.size);
+}
+
+function tokenSet(value) {
+  const tokens = value.match(/[\p{Script=Han}]{2}|[a-z0-9]{3,}/gu) || [];
+  return new Set(tokens);
+}
+
+function pruneExpiredWatchNewsCaches(store) {
+  const cache = store.newsCache || {};
+  const cutoff = Date.now() - WATCH_NEWS_RETENTION_MS;
+  for (const [key, value] of Object.entries(cache)) {
+    if (key.startsWith("watch:auto:") && value?.savedAt && value.savedAt < cutoff) delete cache[key];
+  }
 }
 
 function keywordMatchesNews(text, keyword) {

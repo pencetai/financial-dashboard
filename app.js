@@ -395,7 +395,7 @@ function updateSearchStatus() {
     return;
   }
   watchSearchStatus.textContent = isLoadingWatchNews
-    ? "正在自动获取已关注股票的近 7 日真实新闻热榜..."
+    ? "正在读取已关注股票的自动新闻热榜..."
     : `关注热榜来源：${watchNewsSource}${watchNewsNextRefreshAt ? `，下次自动刷新：${watchNewsNextRefreshAt}` : ""}。搜索框仅作为临时补充入口。`;
 }
 
@@ -500,7 +500,7 @@ function renderNews() {
 
   const rows = groups
     .flatMap((group) => group.items.map((item) => ({ group, item })))
-    .sort((a, b) => b.item.importance - a.item.importance)
+    .sort((a, b) => (b.item.rankScore || b.item.importance) - (a.item.rankScore || a.item.importance))
     .slice(0, 20);
   if (rows.length && !rows.some(({ item }) => item.id === activeNewsId)) {
     activeNewsId = rows[0].item.id;
@@ -528,7 +528,7 @@ function renderNews() {
                         <span class="news-rank">${index + 1}</span>
                         <span>
                           <strong>${item.title}</strong>
-                          <small>${group.title} · ${item.time} · ${formatAnalyzedTime(item.analyzedAt)} · ${renderStars(item.importance)}</small>
+                          <small>${group.title} · ${formatCollectedAnalyzedTime(item)} · ${renderStars(item.importance)}</small>
                         </span>
                         <em>${item.impact}</em>
                       </button>
@@ -537,7 +537,7 @@ function renderNews() {
                   `
                 )
                 .join("")
-            : `<div class="empty-state">没有找到两星以上的近 7 日新闻</div>`
+            : `<div class="empty-state">没有找到两星以上的自动新闻</div>`
         }
       </div>
     </section>
@@ -556,19 +556,27 @@ function renderNews() {
   }
 }
 
-function formatAnalyzedTime(value) {
-  if (!value) return "分析时间：本轮缓存";
+function formatCollectedAnalyzedTime(item) {
+  const collected = formatClockTime(item.collectedAt);
+  const analyzed = formatClockTime(item.analyzedAt);
+  if (collected && analyzed && collected !== analyzed) return `收集 ${collected} · 分析 ${analyzed}`;
+  if (analyzed) return `收集分析 ${analyzed}`;
+  return "收集分析：本轮缓存";
+}
+
+function formatClockTime(value) {
+  if (!value) return "";
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "分析时间：本轮缓存";
-  return `分析 ${date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`;
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
 }
 
 function renderNewsDetail(group, item) {
   return `
     <div class="inline-news-detail">
       <section>
-        <strong>最后分析时间</strong>
-        <p>${formatAnalyzedTime(item.analyzedAt)}。新闻重要性会随时间衰减，越新的事件排序权重越高。</p>
+        <strong>收集与分析时间</strong>
+        <p>${formatCollectedAnalyzedTime(item)}。热榜按新闻新鲜度和重要程度综合排序，超过 7 天的缓存会自动删除。</p>
       </section>
       <section>
         <strong>详细新闻</strong>

@@ -3,21 +3,36 @@
 金融仪表台测试版，当前包含：
 
 - 全球金融监控
-- 关注新闻与影响分析
+- 关注股票新闻热榜
 - 选股策略工作台
-- 轻量 Node API 后端骨架
+- 轻量 Node 后端 API
 
-当前数据仍是模拟数据，但接口已经按后续接入真实行情、新闻搜索、Codex 分析和用户权限的方向预留。
+## 当前前后端边界
 
-## 本地运行
+目前项目已经做了逻辑分层：
 
-静态预览：
+```text
+index.html          前端页面结构
+styles.css          前端样式
+app.js              前端交互与 API 调用
 
-```bash
-打开 index.html
+server.js           后端 HTTP 入口，兼容当前部署方式
+server/config.js    后端配置、数据目录、刷新间隔、密钥读取
+server/agent/       后端 agent 分析入口，未来 OpenAI/Codex 调用放这里
+data/store.json     运行时缓存，不提交到 Git
 ```
 
-带 API 运行：
+前端只调用自己的后端接口，不保存任何 API Key 或 agent token。
+
+后端负责：
+
+- 定时获取关注新闻
+- 过滤、去重、排序、缓存新闻
+- 后续调用 agent 分析新闻
+- 管理登录、权限、使用次数
+- 向前端提供 `/api/...` 数据接口
+
+## 本地运行
 
 ```bash
 npm start
@@ -35,10 +50,29 @@ http://127.0.0.1:3000
 demo / demo123
 ```
 
+## 环境变量
+
+复制 `.env.example` 作为服务器环境变量参考。
+
+重要原则：
+
+- 不要把真实 token 写入 `app.js`
+- 不要把真实 token 提交到 GitHub
+- agent/API Key 只能放在服务器环境变量里
+
+示例：
+
+```bash
+export OPENAI_API_KEY="your_key_here"
+export WATCH_NEWS_REFRESH_MS=1800000
+npm start
+```
+
 ## API
 
 ```text
 GET  /api/market/overview
+GET  /api/watch/news
 POST /api/news/search
 GET  /api/watchlist
 POST /api/watchlist
@@ -50,28 +84,13 @@ POST /api/strategy/hot-money
 
 ## 服务器部署
 
-在 Ubuntu 服务器拉取代码：
-
 ```bash
 cd /var/www/financial-dashboard
 git pull
-```
-
-安装 Node.js 后运行：
-
-```bash
 npm start
 ```
 
 建议正式运行时用 systemd 管理 Node 服务。
-
-创建服务文件：
-
-```bash
-sudo nano /etc/systemd/system/financial-dashboard.service
-```
-
-填入：
 
 ```ini
 [Unit]
@@ -84,23 +103,15 @@ ExecStart=/usr/bin/node /var/www/financial-dashboard/server.js
 Restart=always
 RestartSec=3
 Environment=PORT=3000
+Environment=WATCH_NEWS_REFRESH_MS=1800000
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-启动服务：
+## Nginx
 
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable financial-dashboard
-sudo systemctl start financial-dashboard
-sudo systemctl status financial-dashboard
-```
-
-## Nginx 配置
-
-如果使用 Node 后端，推荐让 Nginx 代理 `/api`，同时继续托管前端文件：
+当前为了兼容已有部署，前端静态文件仍在项目根目录。Nginx 可以继续这样配置：
 
 ```nginx
 server {
@@ -125,29 +136,4 @@ server {
 }
 ```
 
-检查并重载：
-
-```bash
-sudo nginx -t
-sudo systemctl reload nginx
-```
-
-## 后续真实接入
-
-建议顺序：
-
-1. 关注新闻：`/api/news/search` 已优先尝试 Google News RSS 近 7 日搜索，失败时回退模拟数据。
-2. 选股策略：`/api/strategy/hot-money` 已优先尝试公开龙虎榜数据，失败时回退模拟游资数据。
-3. 行情监控：后续再用免费行情源替换 `/api/market/overview`。
-4. 把 `data/store.json` 换成 SQLite 或 PostgreSQL。
-5. 完善登录、用户关注列表和搜索次数限制。
-
-返回字段中的 `source` 可以判断数据来源：
-
-```text
-google-news-rss      新闻来自联网 RSS
-eastmoney-lhb        游资策略来自公开龙虎榜数据
-mock-codex-search    新闻回退到模拟数据
-mock-hot-money       游资策略回退到模拟数据
-mock-cache           行情仍是模拟缓存
-```
+后续如果要进一步拆分，可以把前端迁移到 `public/` 或独立 `frontend/`，同时把 Nginx root 改过去。

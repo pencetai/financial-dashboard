@@ -3,6 +3,7 @@
 Thumbs.db
 node_modules/
 dist/
+lovable-export/
 data/store.json
 *.log
 .env

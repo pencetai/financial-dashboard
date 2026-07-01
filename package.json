@@ -1,12 +1,30 @@
 {
   "name": "financial-dashboard",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
-  "description": "Financial dashboard prototype with static UI and lightweight API server.",
+  "description": "Financial dashboard with a React frontend and lightweight API server.",
   "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 5173",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 4173",
     "start": "node server.js"
   },
   "engines": {
     "node": ">=18"
-  }
+  },
+  "dependencies": {
+    "@vitejs/plugin-react-swc": "^3.11.0",
+    "autoprefixer": "^10.4.21",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.462.0",
+    "postcss": "^8.5.6",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tailwind-merge": "^2.6.0",
+    "tailwindcss": "^3.4.17",
+    "tailwindcss-animate": "^1.0.7",
+    "typescript": "^5.8.3",
+    "vite": "^5.4.19"
+  },
+  "devDependencies": {}
 }

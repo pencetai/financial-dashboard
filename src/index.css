@@ -1,0 +1,69 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 210 25% 98%;
+    --foreground: 215 28% 17%;
+    --surface: 0 0% 100%;
+    --surface-muted: 210 20% 96%;
+    --card: 0 0% 100%;
+    --card-foreground: 215 28% 17%;
+    --primary: 199 89% 42%;
+    --primary-foreground: 0 0% 100%;
+    --primary-soft: 199 90% 94%;
+    --muted: 210 20% 96%;
+    --muted-foreground: 215 15% 46%;
+    --accent: 199 90% 94%;
+    --accent-foreground: 199 89% 32%;
+    --gain: 152 62% 40%;
+    --gain-foreground: 0 0% 100%;
+    --gain-soft: 152 60% 94%;
+    --loss: 4 78% 55%;
+    --loss-foreground: 0 0% 100%;
+    --loss-soft: 4 78% 96%;
+    --warning: 32 95% 52%;
+    --warning-foreground: 0 0% 100%;
+    --warning-soft: 32 95% 94%;
+    --border: 214 20% 90%;
+    --border-strong: 214 20% 82%;
+    --input: 214 20% 90%;
+    --ring: 199 89% 42%;
+    --radius: 6px;
+    --shadow-card: 0 1px 2px hsl(215 25% 20% / 0.04), 0 1px 3px hsl(215 25% 20% / 0.03);
+    --shadow-elev: 0 4px 12px hsl(215 25% 20% / 0.06);
+    --sidebar-background: 0 0% 100%;
+    --sidebar-foreground: 215 20% 30%;
+    --sidebar-accent: 199 90% 96%;
+    --sidebar-accent-foreground: 199 89% 32%;
+    --sidebar-border: 214 20% 92%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    margin: 0;
+    min-width: 1180px;
+    font-feature-settings: "cv02", "cv03", "cv04", "tnum";
+    font-family: "Inter", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  }
+
+  button,
+  input {
+    font: inherit;
+  }
+
+  .num {
+    font-variant-numeric: tabular-nums;
+  }
+}

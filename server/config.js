@@ -1,11 +1,12 @@
 const path = require("path");
 
 const APP_ROOT = path.resolve(__dirname, "..");
+const DIST_ROOT = path.join(APP_ROOT, "dist");
 
 const config = {
   port: Number(process.env.PORT || 3000),
   appRoot: APP_ROOT,
-  publicRoot: APP_ROOT,
+  publicRoot: require("fs").existsSync(DIST_ROOT) ? DIST_ROOT : APP_ROOT,
   dataDir: path.join(APP_ROOT, "data"),
   storeFile: path.join(APP_ROOT, "data", "store.json"),
   watchNews: {
